@@ -1,0 +1,255 @@
+"""
+Trajectoire 2D (par camera) de la pomme de terre - gauche ET droite.
+
+Ce script combine :
+  - la segmentation (meme logique que segment_object.py, methode "difference")
+  - le calibrage camera (K, dist issus de CalibrationStereo.yml)
+
+Pour chaque cote (gauche / droite), et pour chaque image du dossier
+correspondant (traitee comme une frame temporelle, dans l'ordre alphabetique
+des noms de fichiers), on :
+  1) segmente la pomme de terre (masque + contour principal)
+  2) calcule son centroide (moments du contour -> plus precis que le centre
+     de la bounding box)
+  3) corrige la distorsion optique du centroide avec cv2.undistortPoints
+     (en gardant la meme matrice K, donc le resultat reste en pixels, mais
+     sur des lignes droites -> comparable d'une frame a l'autre)
+
+La premiere image (triee) de chaque dossier sert automatiquement d'image de
+fond pour ce cote (comme pour la segmentation).
+
+Sorties, regroupees dans un seul dossier DOSSIER_SORTIE :
+
+  trajectoire/
+    trajectoire_gauche/
+      trajectoire_2d.csv
+      trajectoire_2d.png
+      trajectoire_2d_overlay.png
+    trajectoire_droite/
+      trajectoire_2d.csv
+      trajectoire_2d.png
+      trajectoire_2d_overlay.png
+
+A ADAPTER : la section PARAMETRES ci-dessous.
+"""
+
+import cv2
+import numpy as np
+import glob
+import os
+import csv
+import matplotlib.pyplot as plt
+
+# ==========================================================================
+# PARAMETRES A ADAPTER
+# ==========================================================================
+
+DOSSIER_ENTREE_GAUCHE = "CamG"   # dossier des images camera gauche
+DOSSIER_ENTREE_DROITE = "CamD"   # dossier des images camera droite
+EXTENSION = "*.tif"
+
+SEUIL_DIFFERENCE = 20
+
+TAILLE_NOYAU_MORPHO = 7
+AIRE_MINIMALE = 500
+
+CALIBRATION_YML = "CalibrationStereo.yml"
+
+DOSSIER_SORTIE = "trajectoire"    # dossier de sortie commun (gauche + droite)
+
+
+# ==========================================================================
+# SEGMENTATION (reprise de segment_object.py, methode difference uniquement)
+# ==========================================================================
+def segmenter_et_centrer(path, img_fond):
+    img = cv2.imread(path)
+    if img is None:
+        print("Erreur lecture :", path)
+        return None
+
+    gris = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gris_fond = cv2.cvtColor(img_fond, cv2.COLOR_BGR2GRAY)
+
+    diff = cv2.absdiff(gris, gris_fond)
+    _, masque = cv2.threshold(diff, SEUIL_DIFFERENCE, 255, cv2.THRESH_BINARY)
+
+    noyau = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (TAILLE_NOYAU_MORPHO, TAILLE_NOYAU_MORPHO))
+    masque = cv2.morphologyEx(masque, cv2.MORPH_OPEN, noyau)
+    masque = cv2.morphologyEx(masque, cv2.MORPH_CLOSE, noyau)
+
+    contours, _ = cv2.findContours(masque, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        print("Aucun objet trouve :", path)
+        return None
+
+    contour = max(contours, key=cv2.contourArea)
+    aire = cv2.contourArea(contour)
+    if aire < AIRE_MINIMALE:
+        print(f"Objet trop petit ({aire:.0f} px), ignore :", path)
+        return None
+
+    m = cv2.moments(contour)
+    if m["m00"] == 0:
+        return None
+    cx = m["m10"] / m["m00"]
+    cy = m["m01"] / m["m00"]
+
+    return cx, cy, aire
+
+
+# ==========================================================================
+# CHARGEMENT DU CALIBRAGE
+# ==========================================================================
+def charger_calibrage(path_yml, camera):
+    fs = cv2.FileStorage(path_yml, cv2.FILE_STORAGE_READ)
+    if not fs.isOpened():
+        raise RuntimeError(f"Impossible d'ouvrir {path_yml}")
+
+    K = fs.getNode(f"K_{camera}").mat()
+    dist = fs.getNode(f"dist_{camera}").mat()
+    fs.release()
+
+    if K is None or dist is None:
+        raise RuntimeError(f"K_{camera}/dist_{camera} introuvables dans {path_yml}")
+
+    return K, dist
+
+
+def corriger_distorsion(cx, cy, K, dist):
+    pts = np.array([[[cx, cy]]], dtype=np.float64)
+    # P=K -> on reprojette dans le meme repere pixel (pas de reprojection dans
+    # un repere normalise), donc le resultat reste directement comparable a
+    # (cx, cy) d'origine.
+    undist = cv2.undistortPoints(pts, K, dist, P=K)
+    return undist[0, 0, 0], undist[0, 0, 1]
+
+
+# ==========================================================================
+# TRAITEMENT D'UN COTE (une camera : gauche ou droite)
+# ==========================================================================
+def traiter_camera(dossier_entree, camera, nom_sortie):
+    """
+    Calcule la trajectoire 2D pour un cote donne et sauvegarde les
+    resultats dans DOSSIER_SORTIE/nom_sortie/.
+    `camera` doit correspondre au suffixe utilise dans CalibrationStereo.yml
+    (par ex. "G" ou "D") pour charger K_<camera>/dist_<camera>.
+    """
+    dossier_sortie_cote = os.path.join(DOSSIER_SORTIE, nom_sortie)
+    os.makedirs(dossier_sortie_cote, exist_ok=True)
+
+    print(f"\n=== {nom_sortie} (camera {camera}) ===")
+    print(f"Dossier : {dossier_entree}")
+
+    images = sorted(glob.glob(os.path.join(dossier_entree, EXTENSION)))
+    if not images:
+        print(f"Aucune image trouvee dans {dossier_entree}, cote ignore.")
+        return
+
+    img_fond = cv2.imread(images[0])
+    if img_fond is None:
+        raise RuntimeError(f"Impossible de lire l'image de fond : {images[0]}")
+    print("Image de fond utilisee :", os.path.basename(images[0]))
+    images = images[1:]   # on ne segmente plus l'image de reference elle-meme
+
+    K, dist = charger_calibrage(CALIBRATION_YML, camera)
+
+    print(f"Images trouvees : {len(images)}")
+
+    trajectoire = []  # liste de dict: frame, cx_brut, cy_brut, cx_corr, cy_corr
+
+    for path in images:
+        nom = os.path.splitext(os.path.basename(path))[0]
+        res = segmenter_et_centrer(path, img_fond)
+        if res is None:
+            print("  -> ignoree :", nom)
+            continue
+
+        cx, cy, aire = res
+        cx_c, cy_c = corriger_distorsion(cx, cy, K, dist)
+
+        trajectoire.append({
+            "frame": nom,
+            "cx_brut": cx, "cy_brut": cy,
+            "cx_corrige": cx_c, "cy_corrige": cy_c,
+            "aire_px": aire,
+        })
+        print(f"{nom}: brut=({cx:.1f},{cy:.1f})  corrige=({cx_c:.1f},{cy_c:.1f})")
+
+    print(f"\n{len(trajectoire)}/{len(images)} frames valides ({nom_sortie})")
+
+    # ----------------------------------------------------------------
+    # SAUVEGARDE CSV
+    # ----------------------------------------------------------------
+    csv_path = os.path.join(dossier_sortie_cote, "trajectoire_2d.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["frame", "cx_brut", "cy_brut", "cx_corrige", "cy_corrige", "aire_px"])
+        writer.writeheader()
+        writer.writerows(trajectoire)
+    print("Trajectoire sauvegardee dans", csv_path)
+
+    # ----------------------------------------------------------------
+    # GRAPHIQUE : trajectoire brute vs corrigee (degrade de couleur = temps)
+    # ----------------------------------------------------------------
+    if trajectoire:
+        cx_brut = [t["cx_brut"] for t in trajectoire]
+        cy_brut = [t["cy_brut"] for t in trajectoire]
+        cx_corr = [t["cx_corrige"] for t in trajectoire]
+        cy_corr = [t["cy_corrige"] for t in trajectoire]
+        n = len(trajectoire)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+
+        sc0 = axes[0].scatter(cx_brut, cy_brut, c=range(n), cmap="viridis", s=18)
+        axes[0].plot(cx_brut, cy_brut, "-", color="gray", alpha=0.4, linewidth=1)
+        axes[0].set_title(f"Trajectoire brute (pixels) - {nom_sortie}")
+        axes[0].invert_yaxis()
+        axes[0].set_aspect("equal")
+        fig.colorbar(sc0, ax=axes[0], label="frame (temps)")
+
+        sc1 = axes[1].scatter(cx_corr, cy_corr, c=range(n), cmap="viridis", s=18)
+        axes[1].plot(cx_corr, cy_corr, "-", color="gray", alpha=0.4, linewidth=1)
+        axes[1].set_title(f"Trajectoire corrigee (distorsion enlevee) - {nom_sortie}")
+        axes[1].invert_yaxis()
+        axes[1].set_aspect("equal")
+        fig.colorbar(sc1, ax=axes[1], label="frame (temps)")
+
+        plt.tight_layout()
+        plot_path = os.path.join(dossier_sortie_cote, "trajectoire_2d.png")
+        plt.savefig(plot_path, dpi=150)
+        plt.close(fig)
+        print("Graphique sauvegarde dans", plot_path)
+
+        # ------------------------------------------------------------
+        # Superposition sur une image de fond (visualisation dans la scene)
+        # ------------------------------------------------------------
+        overlay = img_fond.copy()
+        pts = np.array(list(zip(cx_corr, cy_corr)), dtype=np.int32)
+        for i in range(1, len(pts)):
+            couleur = (
+                int(255 * (1 - i / n)),   # bleu -> decroit
+                int(255 * (i / n)),       # vert -> croit
+                0
+            )
+            cv2.line(overlay, tuple(pts[i - 1]), tuple(pts[i]), couleur, 2)
+        for p in pts:
+            cv2.circle(overlay, tuple(p), 3, (0, 0, 255), -1)
+
+        overlay_path = os.path.join(dossier_sortie_cote, "trajectoire_2d_overlay.png")
+        cv2.imwrite(overlay_path, overlay)
+        print("Overlay sauvegarde dans", overlay_path)
+    else:
+        print(f"Aucune trajectoire a tracer ({nom_sortie}).")
+
+
+# ==========================================================================
+# PROGRAMME PRINCIPAL
+# ==========================================================================
+os.makedirs(DOSSIER_SORTIE, exist_ok=True)
+
+traiter_camera(DOSSIER_ENTREE_GAUCHE, "G", "trajectoire_gauche")
+traiter_camera(DOSSIER_ENTREE_DROITE, "D", "trajectoire_droite")
+
+print("\n====================")
+print("Trajectoires 2D terminees pour les deux cotes")
+print(f"Resultats dans : {DOSSIER_SORTIE}/trajectoire_gauche/ et {DOSSIER_SORTIE}/trajectoire_droite/")
+print("====================")
