@@ -1,0 +1,8 @@
+# Calibration du plan du plateau -- genere automatiquement
+centre_x=34.093421399513204
+centre_y=203.96022517413968
+centre_z=1359.7528172536718
+normale_x=-0.010723987827822162
+normale_y=-0.9721122057726611
+normale_z=-0.23427090189112298
+residu_mm=0.12879852878321033
